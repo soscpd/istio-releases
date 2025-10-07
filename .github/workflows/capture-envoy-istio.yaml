@@ -131,7 +131,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.branch }}
           fetch-depth: 0
 
       - name: Install deps
@@ -456,7 +455,6 @@ jobs:
         with:
           commit_message: "chore: capture Envoy/Istio releases (best-effort)"
           file_pattern: |
-            releases/**
             state/releases-processed.json
             state/capture-failed.json
 
