@@ -1,77 +1,25 @@
 name: Capture Envoy & Istio Releases
 
-# Capture Envoy & Istio Releases (obviously)
-
-# • Permissions: `contents: write` (to commit outputs).
-# • Concurrency: group `capture-releases`, do not cancel in-progress.
-# • Tools auto-installed: jq, curl, skopeo, yq (v4.x).
-# • Secrets: `GITHUB_TOKEN` (Actions-provided; unauth calls allowed but risk rate limits).
-
-# • Config (required): `CONFIG_JSON` env with `targets[]`:
-
-# * Fields per target: `repo`, `output_dir` (supports `{tag}`), `strip_v_prefix` (bool), `include_prereleases` (bool), `use_tags_if_no_releases` (bool), optional `images[]` (id, ref with `{tag}`/`{tag_no_v}`), optional `extra_refs[]` (key, resolve_for).
-# * Placeholders: `{tag}`, `{tag_no_v}`.
-
-# • Optional env:
-
-# * `START_FROM`: semver baseline; formats: global `vX.Y.Z` and/or per repo `owner/repo@vX.Y.Z` (comma-sep).
-# * `RUNTIME_IGNORE`: comma-sep `owner/repo@tag` to skip.
-# * `ACT`: set `true` to skip committing (local testing).
-
-# • Tag selection: only semver `^v?[0-9]+\.[0-9]+\.[0-9]+$`; filter prereleases if `include_prereleases=false`; fallback to `/tags` when no Releases and `use_tags_if_no_releases=true`; apply `START_FROM`, then `RUNTIME_IGNORE`; skip already processed tags.
-
-# • State (idempotency):
-
-# * `state/releases-processed.json` — per repo list of processed tags.
-# * `state/capture-failed.json` — array of failures with details/timestamps.
-
-# • Main job (`capture`) flow:
-
-# 1. List tags/releases via GitHub API (paged).
-# 2. For each unseen tag: resolve `extra_refs` to SHAs; inspect image digests via skopeo (best-effort).
-# 3. Write `releases/<product>/<tag>/release.yaml`.
-# 4. Update state; collect CREATED/FAILED arrays as step outputs.
-# 5. Commit changes if any (unless `ACT=true`).
-
-# • Generated file (`release.yaml`) shape:
-
-# * `base-image.registry|version` (digest), nested `.distroless.*`; `release.ref`, `release-fips.ref` as `owner/repo@<sha>` or null.
-
-# • Job outputs (for downstream use):
-
-# * `created` (JSON string array of file paths).
-# * `failed` (JSON array with `repo`, `tag`, `sha_errors`, `digest_errors`, `when`).
-
-# • Fan-out job (`act_on_captured`): runs once per file in `created` (matrix `file`); placeholder step to build/notify/PR.
-
-# • Commit scope: `releases/**`, `state/releases-processed.json`, `state/capture-failed.json`; message “chore: capture Envoy/Istio releases (best-effort)”.
-
-# • Common ops:
-
-# * Start from specific versions: set `START_FROM`.
-# * Ignore noisy tags: set `RUNTIME_IGNORE`.
-# * Local dry-run without commits: set `ACT=true`.
-# * Extend coverage: append targets to `CONFIG_JSON.targets`.
-
-###############
+# Ops notes (condensed):
+# - Permissions: contents: write
+# - Concurrency: capture-releases (no cancel-in-progress)
+# - Tools: jq, curl, skopeo, yq (v4.x)
+# - Secret: GITHUB_TOKEN (rate-limit safe)
 
 on:
   push:
-    branches:
-      - envoy-istio-metadata
+    branches: [envoy-istio-metadata]
   workflow_dispatch:
     inputs:
       branch:
-        description: 'Target branch'
+        description: 'Target branch/ref (used by checkout)'
         required: true
         default: 'envoy-istio-metadata'
-        type: environment
+        type: string
       start_from:
-        description: 'Envoy/Istio first release to process'
+        description: 'Global/per-repo baseline (e.g. v1.28.0 or owner/repo@vX.Y.Z,...)'
         required: false
-        type: environment
-
-
+        type: string
 
 permissions:
   contents: write
@@ -87,7 +35,6 @@ jobs:
       created: ${{ steps.finish.outputs.CREATED_JSON }}   # JSON array of created file paths
       failed:  ${{ steps.finish.outputs.FAILED_JSON }}    # JSON array of failures
     env:
-      # Hard-coded targets
       CONFIG_JSON: |
         {
           "targets": [
@@ -125,12 +72,11 @@ jobs:
             }
           ]
         }
-      # Optional: skip specific tags without editing the JSON above (comma-separated)
       RUNTIME_IGNORE: ""   # e.g. "envoyproxy/envoy@v1.0.0,istio/istio@1.27.0"
-
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.branch }}
           fetch-depth: 0
 
       - name: Install deps
@@ -157,84 +103,34 @@ jobs:
           START_FROM: ${{ inputs.start_from }}
         run: |
           set -Eeuo pipefail
-
           CONFIG='${{ env.CONFIG_JSON }}'
           STATE=state/releases-processed.json
           CREATED_JSON='[]'
           FAILED_JSON='[]'
 
-          # put near the top of the step, after set -Eeuo pipefail
-          jqp() {  # usage: jqp "$json_var" 'jq filter'
-            printf '%s' "$1" | jq -r "$2"
-          }
+          jqp() { printf '%s' "$1" | jq -r "$2"; }
 
-          # Parse START_FROM into a map and an optional global default
-          declare -A START_MAP=()
-          START_GLOBAL=""
+          declare -A START_MAP=(); START_GLOBAL=""
           if [[ -n "${START_FROM:-}" ]]; then
             IFS=',' read -ra _sf_items <<< "$START_FROM"
             for it in "${_sf_items[@]}"; do
-              it="${it//[[:space:]]/}"
-              [[ -z "$it" ]] && continue
-              if [[ "$it" == *@* ]]; then
-                # repo-specific: owner/repo@tag
-                START_MAP["${it%@*}"]="${it#*@}"
-              else
-                # global
-                START_GLOBAL="$it"
-              fi
+              it="${it//[[:space:]]/}"; [[ -z "$it" ]] && continue
+              if [[ "$it" == *@* ]]; then START_MAP["${it%@*}"]="${it#*@}"; else START_GLOBAL="$it"; fi
             done
           fi
 
-          # semver compare: returns 0 if verA >= verB, 1 otherwise
-          semver_ge() {
-            local A="${1#v}" B="${2#v}"
-            local a1 a2 a3 b1 b2 b3
-            IFS='.' read -r a1 a2 a3 <<<"$A"
-            IFS='.' read -r b1 b2 b3 <<<"$B"
-            a1=${a1:-0}; a2=${a2:-0}; a3=${a3:-0}
-            b1=${b1:-0}; b2=${b2:-0}; b3=${b3:-0}
-            # numeric compare
-            if   (( a1 > b1 )); then return 0
-            elif (( a1 < b1 )); then return 1
-            fi
-            if   (( a2 > b2 )); then return 0
-            elif (( a2 < b2 )); then return 1
-            fi
-            if   (( a3 >= b3 )); then return 0
-            else return 1
-            fi
-          }
+          semver_ge(){ local A="${1#v}" B="${2#v}"; IFS='.' read -r a1 a2 a3 <<<"$A"; IFS='.' read -r b1 b2 b3 <<<"$B"; a1=${a1:-0};a2=${a2:-0};a3=${a3:-0};b1=${b1:-0};b2=${b2:-0};b3=${b3:-0}; ((a1>b1))&&return 0;((a1<b1))&&return 1; ((a2>b2))&&return 0;((a2<b2))&&return 1; ((a3>=b3))&&return 0||return 1; }
+          meets_start_baseline(){ local repo="$1" tag="$2" base="${START_MAP[$repo]:-$START_GLOBAL}"; [[ -z "$base" ]] && return 0; semver_ge "$tag" "$base"; }
 
-          # decide if a tag is on/after the baseline for a repo
-          meets_start_baseline() {
-            local repo_full="$1" tag="$2"
-            local baseline="${START_MAP[$repo_full]:-$START_GLOBAL}"
-            [[ -z "$baseline" ]] && return 0           # no baseline => allow
-            semver_ge "$tag" "$baseline"
-          }
+          safe_curl(){ if [[ -n "${GITHUB_TOKEN:-}" ]]; then curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" "$@"; else curl -fsSL -H "Accept: application/vnd.github+json" "$@"; fi; }
 
-
-          # token-aware curl (no 401 when testing without token)
-          safe_curl() {
-            if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-              curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" "$@"
-            else
-              curl -fsSL -H "Accept: application/vnd.github+json" "$@"
-            fi
-          }
-
-          # runtime ignore set (env: RUNTIME_IGNORE="owner/repo@tag,owner/repo@tag2")
           declare -A IGNORE_RT=()
           if [[ -n "${RUNTIME_IGNORE:-}" ]]; then
             IFS=',' read -ra _items <<< "$RUNTIME_IGNORE"
-            for it in "${_items[@]}"; do
-              it="${it//[[:space:]]/}"
-              [[ -n "$it" ]] && IGNORE_RT["$it"]=1
-            done
+            for it in "${_items[@]}"; do it="${it//[[:space:]]/}"; [[ -n "$it" ]] && IGNORE_RT["$it"]=1; done
           fi
 
-          jq_get() { printf '%s' "$1" | jq -r "$2 // empty"; }
+          jq_get(){ printf '%s' "$1" | jq -r "$2 // empty"; }
 
           list_tags() {
             local owner="$1" repo="$2" include_pr="$3" use_fallback="$4"
@@ -242,36 +138,26 @@ jobs:
             while :; do
               local r; r=$(safe_curl "https://api.github.com/repos/$owner/$repo/releases?per_page=100&page=$page" || echo '[]')
               all=$( { printf '%s' "$all"; printf '%s' "$r"; } | jq -c -s 'add' )
-              if [ "$(printf '%s' "$r" | jq 'length')" -lt 100 ]; then break; fi
-              ((page++))
+              if [ "$(printf '%s' "$r" | jq 'length')" -lt 100 ]; then break; fi; ((page++))
             done
             local out="[]"
             if [ "$(printf '%s' "$all" | jq 'length')" -gt 0 ]; then
-              if [[ "$include_pr" == "true" ]]; then
-                out=$(printf '%s' "$all"  | jq -c '[ .[] | select(.draft==false) ] | sort_by(.created_at) | map(.tag_name)')
-              else
-                out=$(printf '%s' "$all" | jq -c '[ .[] | select(.draft==false and .prerelease==false) ] | sort_by(.created_at) | map(.tag_name)')
-              fi
+              if [[ "$include_pr" == "true" ]]; then out=$(printf '%s' "$all" | jq -c '[ .[] | select(.draft==false) ] | sort_by(.created_at) | map(.tag_name)'); else out=$(printf '%s' "$all" | jq -c '[ .[] | select(.draft==false and .prerelease==false) ] | sort_by(.created_at) | map(.tag_name)'); fi
             elif [[ "$use_fallback" == "true" ]]; then
               local tags="[]"; page=1
               while :; do
                 local t; t=$(safe_curl "https://api.github.com/repos/$owner/$repo/tags?per_page=100&page=$page" || echo '[]')
                 tags=$( { printf '%s' "$tags"; printf '%s' "$t"; } | jq -c -s 'add' )
-                if [ "$(printf '%s' "$t" | jq 'length')" -lt 100 ]; then break; fi
-                ((page++))
+                if [ "$(printf '%s' "$t" | jq 'length')" -lt 100 ]; then break; fi; ((page++))
               done
               out=$(printf '%s' "$tags" | jq -c 'reverse | map(.name)')
             fi
             echo "$out"
           }
 
-          # Keep only sensible tags (semver); drop "untagged-..." etc.
-          is_valid_tag() {
-            local tag="$1"
-            [[ "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          }
+          is_valid_tag(){ [[ "$1" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
 
-          resolve_ref() { # prints SHA or empty
+          resolve_ref(){
             local owner="$1" repo="$2" ref="$3"
             local r type sha
             r=$(safe_curl "https://api.github.com/repos/$owner/$repo/git/ref/tags/${ref}" 2>/dev/null || true)
@@ -281,23 +167,17 @@ jobs:
               if [[ "$type" == "tag" ]]; then
                 local t; t=$(safe_curl "https://api.github.com/repos/$owner/$repo/git/tags/${sha}" 2>/dev/null || true)
                 echo "$(jq -r '.object.sha // empty' <<<"$t")"; return 0
-              else
-                echo "$sha"; return 0
-              fi
+              else echo "$sha"; return 0; fi
             fi
             r=$(safe_curl "https://api.github.com/repos/$owner/$repo/git/ref/heads/${ref}" 2>/dev/null || true)
-            sha=$(jq -r '.object.sha // empty' <<<"$r")
-            [[ -n "$sha" ]] && { echo "$sha"; return 0; }
+            sha=$(jq -r '.object.sha // empty' <<<"$r"); [[ -n "$sha" ]] && { echo "$sha"; return 0; }
             echo ""
           }
 
-          process_one() {
+          process_one(){
             local owner="$1" name="$2" tag="$3" target_json="$4"
-
             local strip_v; strip_v=$(jq_get "$target_json" '.strip_v_prefix'); [[ -z "$strip_v" ]] && strip_v="false"
             local tag_no_v="$tag"; if [[ "$strip_v" == "true" && "$tag_no_v" =~ ^v ]]; then tag_no_v="${tag_no_v#v}"; fi
-
-            # resolve SHAs
             local extra='{}'; local sha_errors="[]"
             local ecnt; ecnt=$(jq '(.extra_refs // []) | length' <<<"$target_json")
             for (( i=0; i<ecnt; i++ )); do
@@ -306,14 +186,9 @@ jobs:
               ref_tpl=$(jq -r ".extra_refs[$i].resolve_for" <<<"$target_json")
               ref="${ref_tpl//\{tag\}/$tag}"
               sha=$(resolve_ref "$owner" "$name" "$ref" || true)
-              if [[ -n "$sha" ]]; then
-                extra=$(jq -c --arg k "$key" --arg s "$sha" '. + {($k): $s}' <<<"$extra")
-              else
-                sha_errors=$(jq -c --arg k "$key" --arg r "$ref" '. + [ {ref_key:$k, ref:$r} ]' <<<"$sha_errors")
-              fi
+              if [[ -n "$sha" ]]; then extra=$(jq -c --arg k "$key" --arg s "$sha" '. + {($k): $s}' <<<"$extra")
+              else sha_errors=$(jq -c --arg k "$key" --arg r "$ref" '. + [ {ref_key:$k, ref:$r} ]' <<<"$sha_errors"); fi
             done
-
-            # resolve image digests (best-effort)
             local dig='{}'; local dig_err='[]'
             local icnt; icnt=$(jq '(.images // []) | length' <<<"$target_json")
             for (( j=0; j<icnt; j++ )); do
@@ -328,14 +203,11 @@ jobs:
               fi
               rm -f /tmp/err.$$
             done
-
-            # write YAML (null-safe; no jq // operator)
             local out_dir_tpl out_dir out_file
             out_dir_tpl=$(jq_get "$target_json" '.output_dir')
             out_dir="${out_dir_tpl//\{tag\}/$tag}"
             mkdir -p "$out_dir"
             out_file="$out_dir/release.yaml"
-
             local base_ref base_dig dist_ref dist_dig rel_sha fips_sha
             base_ref=$(printf '%s' "$dig"   | jq -r '."base-image".ref // empty')
             base_dig=$(printf '%s' "$dig"   | jq -r '."base-image".digest // empty')
@@ -343,91 +215,38 @@ jobs:
             dist_dig=$(printf '%s' "$dig"   | jq -r '."base-image.distroless".digest // empty')
             rel_sha=$(printf '%s' "$extra"  | jq -r '."release" // empty')
             fips_sha=$(printf '%s' "$extra" | jq -r '."release-fips" // empty')
-
-            jq -n \
-              --arg base_reg "$base_ref" \
-              --arg base_dig "$base_dig" \
-              --arg dist_reg "$dist_ref" \
-              --arg dist_dig "$dist_dig" \
-              --arg owner "$owner" \
-              --arg name "$name" \
-              --arg rel_sha "$rel_sha" \
-              --arg fips_sha "$fips_sha" \
-              '
+            jq -n --arg base_reg "$base_ref" --arg base_dig "$base_dig" --arg dist_reg "$dist_ref" --arg dist_dig "$dist_dig" --arg owner "$owner" --arg name "$name" --arg rel_sha "$rel_sha" --arg fips_sha "$fips_sha" '
               def nn(s): if s == "" then null else s end;
               def refify(s): if s == "" then null else ($owner + "/" + $name + "@" + s) end;
-
-              {
-                "base-image": {
-                  "registry": nn($base_reg),
-                  "version":  nn($base_dig),
-                  "distroless": {
-                    "registry": nn($dist_reg),
-                    "version":  nn($dist_dig)
-                  }
-                },
-                "release":      { "ref": refify($rel_sha) },
-                "release-fips": { "ref": refify($fips_sha) }
-              }
-              ' \
-            | yq -P > "$out_file"
-
+              { "base-image": { "registry": nn($base_reg), "version": nn($base_dig),
+                  "distroless": { "registry": nn($dist_reg), "version": nn($dist_dig) } },
+                "release": { "ref": refify($rel_sha) },
+                "release-fips": { "ref": refify($fips_sha) } }' | yq -P > "$out_file"
             echo "$out_file"
             echo "$sha_errors" > state/.sha_errors.json
             echo "$dig_err"    > state/.dig_errors.json
           }
 
-          CREATED='[]'
-          FAILED='[]'
-
-          # Stream targets (no argv blow-ups)
+          CREATED='[]'; FAILED='[]'
           while IFS= read -r t; do
-            repo=$(jq_get "$t" '.repo')
-            owner="${repo%%/*}"
-            name="${repo##*/}"
-
+            repo=$(jq_get "$t" '.repo'); owner="${repo%%/*}"; name="${repo##*/}"
             include=$(jq_get "$t" '.include_prereleases'); [[ -z "$include" ]] && include="false"
             fallback=$(jq_get "$t" '.use_tags_if_no_releases'); [[ -z "$fallback" ]] && fallback="true"
-
             tags_json=$(list_tags "$owner" "$name" "$include" "$fallback")
             seen=$(jq -c --arg k "$repo" '.[$k].processed // []' "$STATE")
-
-            # Stream tags (avoid argv explosion). Filter to semver.
             while IFS= read -r tag; do
-              # filter noisy tags
-              if ! is_valid_tag "$tag"; then
-                echo "== skip (non-semver) $repo $tag"
-                continue
-              fi
-
-              # baseline filter
-              if ! meets_start_baseline "$repo" "$tag"; then
-                echo "== skip (before baseline ${START_MAP[$repo]:-$START_GLOBAL}) $repo $tag"
-                continue
-              fi
-
-              # runtime ignore?
-              if [[ -n "${IGNORE_RT["$repo@$tag"]+x}" ]]; then
-                echo "== skip (runtime ignore) $repo $tag"
-                continue
-              fi
-
-              # already processed?
-              if printf '%s' "$seen" | jq -e --arg tg "$tag" 'index($tg) != null' >/dev/null; then
-                continue
-              fi
-
+              if ! is_valid_tag "$tag"; then echo "== skip (non-semver) $repo $tag"; continue; fi
+              if ! meets_start_baseline "$repo" "$tag"; then echo "== skip (before baseline ${START_MAP[$repo]:-$START_GLOBAL}) $repo $tag"; continue; fi
+              if [[ -n "${IGNORE_RT["$repo@$tag"]+x}" ]]; then echo "== skip (runtime ignore) $repo $tag"; continue; fi
+              if printf '%s' "$seen" | jq -e --arg tg "$tag" 'index($tg) != null' >/dev/null; then continue; fi
               echo "== process $repo $tag"
               if file_path=$(process_one "$owner" "$name" "$tag" "$t"); then
                 CREATED=$(printf '%s' "$CREATED" | jq -c --arg f "$file_path" '. + [ $f ]')
-                # mark seen (only on success)
                 new_seen=$(printf '%s' "$seen" | jq -c --arg tg "$tag" '. + [ $tg ] | unique')
                 jq --arg k "$repo" --argjson arr "$new_seen" '.[$k].processed = $arr' "$STATE" > state/.tmp && mv state/.tmp "$STATE"
               else
                 FAILED=$(printf '%s' "$FAILED" | jq -c --arg r "$repo" --arg tg "$tag" '. + [ {repo:$r, tag:$tg, error:"capture-failed"} ]')
               fi
-
-              # append detailed errors, if any
               if [[ -s state/.sha_errors.json || -s state/.dig_errors.json ]]; then
                 sha_e=$(cat state/.sha_errors.json 2>/dev/null || echo '[]')
                 dig_e=$(cat state/.dig_errors.json 2>/dev/null || echo '[]')
@@ -440,14 +259,10 @@ jobs:
             done < <(jq -r '.[]' <<<"$tags_json")
           done < <(jq -c '.targets[]' <<<"$CONFIG")
 
-          echo "CREATED<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$CREATED"     >> "$GITHUB_OUTPUT"
-          echo "EOF"          >> "$GITHUB_OUTPUT"
-
-          echo "FAILED<<EOF"  >> "$GITHUB_OUTPUT"
-          echo "$FAILED"      >> "$GITHUB_OUTPUT"
-          echo "EOF"          >> "$GITHUB_OUTPUT"
-  
+          {
+            echo "CREATED<<EOF"; echo "$CREATED"; echo "EOF";
+            echo "FAILED<<EOF";  echo "$FAILED";  echo "EOF";
+          } >> "$GITHUB_OUTPUT"
 
       - name: Commit outputs (if any)
         if: ${{ (steps.cap.outputs.CREATED != '[]' || steps.cap.outputs.FAILED != '[]') && env.ACT != 'true' }}
@@ -455,6 +270,7 @@ jobs:
         with:
           commit_message: "chore: capture Envoy/Istio releases (best-effort)"
           file_pattern: |
+            releases/**
             state/releases-processed.json
             state/capture-failed.json
 
@@ -465,18 +281,45 @@ jobs:
           echo 'CREATED_JSON=${{ steps.cap.outputs.CREATED }}' >> "$GITHUB_OUTPUT"
           echo 'FAILED_JSON=${{ steps.cap.outputs.FAILED }}'   >> "$GITHUB_OUTPUT"
 
-  act_on_captured:
+  # NEW: Chunk the created file list to respect the 256 matrix cap
+  prepare_fanout:
     needs: capture
     if: ${{ needs.capture.outputs.created != '[]' }}
+    runs-on: ubuntu-latest
+    outputs:
+      chunks: ${{ steps.chunk.outputs.CHUNKS }}   # JSON array of arrays
+    env:
+      MAX_PER_JOB: "64"                           # tune batch size if desired
+    steps:
+      - id: chunk
+        shell: bash
+        run: |
+          set -euo pipefail
+          files='${{ needs.capture.outputs.created }}'
+          size=${MAX_PER_JOB}
+          chunks=$(printf '%s' "$files" | jq -c --argjson s "$size" '
+            def chunks(n): [ range(0; length; n) as $i | .[$i : ($i+n)] ];
+            ( . as $a | if ($a|type)=="array" and ($a|length)>0 then chunks($s) else [] end )
+          ')
+          echo "CHUNKS<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$chunks"     >> "$GITHUB_OUTPUT"
+          echo "EOF"         >> "$GITHUB_OUTPUT"
+
+  act_on_captured:
+    needs: prepare_fanout
+    if: ${{ needs.prepare_fanout.outputs.chunks != '[]' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        file: ${{ fromJSON(needs.capture.outputs.created) }}
+        chunk: ${{ fromJSON(needs.prepare_fanout.outputs.chunks) }}
     steps:
       - uses: actions/checkout@v4
-      - name: Use generated YAML
+      - name: Process chunk
+        shell: bash
         run: |
-          echo "Processing ${{ matrix.file }}"
-          test -f "${{ matrix.file }}" && cat "${{ matrix.file }}" || echo "(file missing?)"
-          # TODO: build image / notify / open PR, whatever
+          echo '${{ matrix.chunk }}' | jq -r '.[]' | while read -r f; do
+            echo "Processing ${f}"
+            test -f "${f}" && cat "${f}" || echo "(file missing?)"
+            # TODO: build image / notify / open PR, whatever
+          done
